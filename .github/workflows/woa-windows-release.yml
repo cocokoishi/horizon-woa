@@ -1,0 +1,178 @@
+# Fork-only release workflow. Every write uses github.repository, never the upstream repo.
+# Runs on GitHub-hosted Windows x64 and native Windows ARM64 runners.
+name: WOA Windows release (x64 + ARM64)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/woa-windows-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: woa-windows-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        shell: bash
+        run: |
+          # A separate namespace prevents collisions with upstream Horizon tags.
+          echo "tag=woa-v0.1.0-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "version=0.1.0-woa.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+  exporters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch public Java exporters (read-only from upstream Nightly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          digest="$(gh api repos/horizon-rust/horizon/releases/tags/nightly --jq '.assets[] | select(.name == "horizon-windows-x64.zip") | .digest')"
+          [[ "$digest" == sha256:* ]] || { echo "::error::No upstream Nightly Windows x64 SHA256 digest"; exit 1; }
+          gh release download nightly --repo horizon-rust/horizon --pattern horizon-windows-x64.zip --dir upstream
+          printf '%s  %s\n' "${digest#sha256:}" "upstream/horizon-windows-x64.zip" | sha256sum -c -
+          mkdir -p unpacked
+          unzip -q upstream/horizon-windows-x64.zip -d unpacked
+          test -f unpacked/horizon-windows-x64/exporters/manifest.json
+          cp -a unpacked/horizon-windows-x64/exporters exporters
+          tar czf exporters.tar.gz exporters
+      - uses: actions/upload-artifact@v4
+        with:
+          name: woa-exporters
+          path: exporters.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: [version, exporters]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      RUSTFLAGS: -C target-feature=+crt-static
+      HORIZON_VERSION: ${{ needs.version.outputs.version }}
+      BIN: target/${{ matrix.target }}/release
+      HORIZON_TELEMETRY_URL: 'off'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: woa-windows-${{ matrix.arch }}
+      - name: Build the native game and companion tools
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p horizon-official --bin horizon-official \
+            -p horizon-client-lib --bin horizon-ctl \
+            -p horizon-prepare --bin horizon-prepare \
+            -p horizon-server --bin horizon-server
+          cp "$BIN/horizon-official.exe" "$BIN/horizon-client.exe"
+          python tools/check_pe_arch.py "${{ matrix.arch }}" \
+            "$BIN/horizon-client.exe" "$BIN/horizon-ctl.exe" \
+            "$BIN/horizon-prepare.exe" "$BIN/horizon-server.exe"
+      - name: Check native programs start
+        run: |
+          set -euo pipefail
+          "$BIN/horizon-client.exe" --help > /dev/null
+          "$BIN/horizon-ctl.exe" --help > /dev/null
+          "$BIN/horizon-prepare.exe" --help > /dev/null
+          "$BIN/horizon-server.exe" --version
+      - uses: actions/download-artifact@v4
+        with:
+          name: woa-exporters
+          path: .
+      - name: Package the playable Windows distribution
+        run: |
+          set -euo pipefail
+          tar xzf exporters.tar.gz
+          cargo run --locked -p xtask -- package "$BIN/horizon-client.exe" "dist/horizon-windows-${{ matrix.arch }}"
+          if [[ "${{ matrix.arch }}" == x64 ]]; then
+            python tools/ci/fetch_dxc.py "dist/horizon-windows-x64"
+          fi
+          cd dist
+          7z a -tzip "horizon-windows-${{ matrix.arch }}.zip" "horizon-windows-${{ matrix.arch }}" > /dev/null
+          test -s "horizon-windows-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: woa-windows-${{ matrix.arch }}
+          path: dist/horizon-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: woa-windows-*
+          path: dist
+          merge-multiple: true
+      - name: Check both architectures and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/horizon-windows-x64.zip
+          test -s dist/horizon-windows-arm64.zip
+          (cd dist && sha256sum horizon-windows-x64.zip horizon-windows-arm64.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish in this fork only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "cocokoishi/horizon-woa" ]] || { echo "::error::Fork-only release guard"; exit 1; }
+          cat > release-notes.md <<EOF
+          Windows builds from this fork at commit ${GITHUB_SHA}.
+
+          - \`horizon-windows-x64.zip\`: Windows x86-64.
+          - \`horizon-windows-arm64.zip\`: native Windows on ARM64 (AArch64, not x64 emulation).
+          - \`SHA256SUMS\`: SHA-256 checksums for both archives.
+
+          Each archive contains the game, horizon-ctl, horizon-prepare, horizon-server and PLAY.txt.
+          Exporter classes were copied read-only from the public upstream Horizon Nightly;
+          Minecraft game files are not redistributed and must be prepared from a legitimately owned copy.
+          These fork builds are not upstream-signed releases.
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Horizon WOA ${TAG}" --notes-file release-notes.md --latest \
+            dist/horizon-windows-x64.zip dist/horizon-windows-arm64.zip dist/SHA256SUMS
